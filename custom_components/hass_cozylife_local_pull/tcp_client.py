@@ -52,7 +52,7 @@ class tcp_client(object):
       Recv:  cmd=publish&device_id=DID&topic=device_DID&message={json}\r\n
     """
 
-    def __init__(self, ip, token=None, device_keys=None):
+    def __init__(self, ip, token=None, device_keys=None, device_id=None):
         self._ip = ip
         self._udp_port = 6095
         self._token = token
@@ -60,7 +60,7 @@ class tcp_client(object):
 
         self._connect = None
         self._device_key = None
-        self._device_id = None
+        self._device_id = device_id  # May be pre-set from config
         self._pid = None
         self._device_type_code = None
         self._icon = None
@@ -69,7 +69,7 @@ class tcp_client(object):
         self._recv_buf = b''
         self._lock = threading.Lock()
 
-        # Get device info via UDP first (sets _device_id, _pid, etc.)
+        # Get device info (UDP first, relay fallback if UDP is blocked)
         self._device_info()
 
         # Resolve device_key now that _device_id is known
@@ -137,42 +137,8 @@ class tcp_client(object):
         thread.daemon = True
         thread.start()
 
-    def _device_info(self) -> None:
-        """Fetch device info via UDP CMD_INFO on port 6095.
-
-        This works cross-subnet because it is a direct UDP unicast to the
-        device IP, not a TCP connection.  The device responds with its did,
-        pid, mac, etc.
-        """
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.settimeout(3)
-            sn = get_sn()
-            msg = json.dumps(
-                {'cmd': CMD_INFO, 'pv': 0, 'sn': sn, 'msg': {}},
-                separators=(',', ':'),
-            )
-            s.sendto(msg.encode(), (self._ip, self._udp_port))
-            data, _ = s.recvfrom(1024)
-            s.close()
-        except Exception as e:
-            _LOGGER.info('_device_info UDP failed for %s: %s', self._ip, e)
-            return
-
-        try:
-            resp = json.loads(data.strip())
-        except Exception:
-            return
-
-        msg_data = resp.get('msg')
-        if not isinstance(msg_data, dict):
-            return
-
-        self._device_id = msg_data.get('did')
-        self._pid = msg_data.get('pid')
-        if not self._device_id or not self._pid:
-            return
-
+    def _lookup_pid_list(self) -> None:
+        """Populate type_code, icon, model_name, dpid from the cloud PID list."""
         pid_list = get_pid_list()
         for item in pid_list:
             for item1 in item.get('m', []):
@@ -184,11 +150,138 @@ class tcp_client(object):
                     break
             if self._device_type_code:
                 break
-
         _LOGGER.info(
             'Device info: id=%s pid=%s type=%s model=%s',
             self._device_id, self._pid,
             self._device_type_code, self._device_model_name,
+        )
+
+    def _device_info_via_relay(self, device_id: str, device_key: str) -> bool:
+        """Fetch device info via relay CMD_INFO.  Returns True on success."""
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(10)
+            s.connect((RELAY_HOST, RELAY_PORT))
+            if self._token:
+                s.sendall(('cmd=auth&token=' + self._token + '\r\n').encode())
+                time.sleep(0.3)
+            sub = (
+                'cmd=subscribe'
+                '&topic=device_' + device_id +
+                '&from=control'
+                '&device_id=' + device_id +
+                '&device_key=' + device_key + '\r\n'
+            )
+            s.sendall(sub.encode())
+            time.sleep(0.3)
+            sn = get_sn()
+            msg = json.dumps(
+                {'cmd': CMD_INFO, 'pv': 0, 'sn': sn, 'msg': {'attr': [0]}},
+                separators=(',', ':'),
+            )
+            line = (
+                'cmd=publish'
+                '&device_id=' + device_id +
+                '&topic=control_' + device_id +
+                '&device_key=' + device_key +
+                '&message=' + msg + '\r\n'
+            )
+            s.sendall(line.encode())
+            buf = b''
+            deadline = time.time() + 5
+            found = False
+            while time.time() < deadline and not found:
+                s.settimeout(max(0.1, deadline - time.time()))
+                try:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                except socket.timeout:
+                    pass
+                while b'\r\n' in buf:
+                    raw_line, buf = buf.split(b'\r\n', 1)
+                    parts = _parse_relay_line(raw_line.decode('utf-8', errors='replace'))
+                    if (
+                        parts.get('cmd') == 'publish'
+                        and parts.get('topic') == 'device_' + device_id
+                        and 'message' in parts
+                    ):
+                        try:
+                            msg_obj = json.loads(parts['message'])
+                            if msg_obj.get('sn') == sn:
+                                msg_data = msg_obj.get('msg', {})
+                                self._device_id = device_id
+                                self._pid = msg_data.get('pid')
+                                if self._pid:
+                                    self._lookup_pid_list()
+                                found = True
+                                break
+                        except (json.JSONDecodeError, AttributeError):
+                            pass
+            s.close()
+            return found
+        except Exception as e:
+            _LOGGER.info('_device_info_via_relay failed: %s', e)
+            return False
+
+    def _device_info(self) -> None:
+        """Fetch device info, trying UDP first, then relay as fallback.
+
+        UDP CMD_INFO (port 6095) works when the device is on a reachable subnet.
+        If UDP is blocked (e.g. HA Core container on a different subnet), we
+        fall back to CMD_INFO via the cloud relay using pre-configured device_keys.
+        """
+        # --- Try UDP ---
+        udp_ok = False
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(3)
+            sn = get_sn()
+            msg = json.dumps(
+                {'cmd': CMD_INFO, 'pv': 0, 'sn': sn, 'msg': {}},
+                separators=(',', ':'),
+            )
+            s.sendto(msg.encode(), (self._ip, self._udp_port))
+            data, _ = s.recvfrom(1024)
+            s.close()
+            resp = json.loads(data.strip())
+            msg_data = resp.get('msg')
+            if isinstance(msg_data, dict):
+                self._device_id = msg_data.get('did')
+                self._pid = msg_data.get('pid')
+                if self._device_id and self._pid:
+                    self._lookup_pid_list()
+                    udp_ok = True
+        except Exception as e:
+            _LOGGER.info('_device_info UDP failed for %s: %s', self._ip, e)
+
+        if udp_ok:
+            return
+
+        # --- Relay fallback ---
+        # If device_id was pre-configured (passed in __init__), use it directly.
+        # Otherwise try all device_keys until one succeeds.
+        candidates = []
+        if self._device_id and self._device_id in self._device_keys:
+            candidates = [(self._device_id, self._device_keys[self._device_id])]
+        elif self._device_keys:
+            candidates = list(self._device_keys.items())
+
+        if not candidates:
+            _LOGGER.warning(
+                'UDP failed and no device_keys configured for %s — device will be unavailable.',
+                self._ip,
+            )
+            return
+
+        for did, dkey in candidates:
+            _LOGGER.info('Trying relay CMD_INFO fallback for device_id=%s', did)
+            if self._device_info_via_relay(did, dkey):
+                return
+
+        _LOGGER.warning(
+            'Could not retrieve device info for %s via UDP or relay.', self._ip
         )
 
     def _normalize_state(self, data: dict) -> dict:

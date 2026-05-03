@@ -41,11 +41,23 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     token = config[DOMAIN].get(TOKEN_CONF)
     device_keys = config[DOMAIN].get(DEVICE_KEYS_CONF) or {}
 
+    # Build a hint map: if there's only one IP and one device_key, map them 1:1.
+    # This lets tcp_client skip UDP discovery and use the relay directly.
+    if len(ip_list) == 1 and len(device_keys) == 1:
+        ip_did_hints = {ip_list[0]: list(device_keys.keys())[0]}
+    else:
+        ip_did_hints = {}
+
     hass.data[DOMAIN] = {
         'temperature': 24,
         'ip': ip_list,
         'tcp_client': [
-            tcp_client(item, token=token, device_keys=device_keys)
+            tcp_client(
+                item,
+                token=token,
+                device_keys=device_keys,
+                device_id=ip_did_hints.get(item),
+            )
             for item in ip_list
         ],
     }
