@@ -48,18 +48,22 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     else:
         ip_did_hints = {}
 
+    def _make_client(ip):
+        return tcp_client(
+            ip,
+            token=token,
+            device_keys=device_keys,
+            device_id=ip_did_hints.get(ip),
+        )
+
+    clients = await asyncio.gather(
+        *[hass.async_add_executor_job(_make_client, item) for item in ip_list]
+    )
+
     hass.data[DOMAIN] = {
         'temperature': 24,
         'ip': ip_list,
-        'tcp_client': [
-            tcp_client(
-                item,
-                token=token,
-                device_keys=device_keys,
-                device_id=ip_did_hints.get(item),
-            )
-            for item in ip_list
-        ],
+        'tcp_client': list(clients),
     }
 
     # Wait for TCP connections and device info to be retrieved
