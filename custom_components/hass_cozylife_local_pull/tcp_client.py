@@ -34,20 +34,20 @@ class tcp_client(object):
     _port = 5555
     _connect = socket
     
-    _device_id = str
+    _device_id = None
     # _device_key = str
-    _pid = str
-    _device_type_code = str
-    _icon = str
-    _device_model_name = str
-    _dpid = []
+    _pid = None
+    _device_type_code = None
+    _icon = None
+    _device_model_name = None
     # last sn
-    _sn = str
+    _sn = None
     
     def __init__(self, ip):
         self._ip = ip
         self._connect = None  # Initialize _connect as None
-        self._close_connection() 
+        self._dpid = []  # Instance-level to avoid shared mutable class attribute
+        self._close_connection()
         self._reconnect()
     
     def _close_connection(self):
@@ -206,6 +206,9 @@ class tcp_client(object):
         :param payload:
         :return:
         """
+        if self._connect is None:
+            _LOGGER.info('_send_receiver: no connection, skipping')
+            return {}
         self._connect.send(self._get_package(cmd, payload))
         try:
             i = 10
@@ -241,6 +244,9 @@ class tcp_client(object):
         :param payload:
         :return:
         """
+        if self._connect is None:
+            _LOGGER.info('_only_send: no connection, skipping')
+            return
         self._connect.send(self._get_package(cmd, payload))
     
     def control(self, payload: dict) -> bool:
