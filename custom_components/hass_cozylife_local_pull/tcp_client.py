@@ -2,265 +2,377 @@
 import json
 import socket
 import time
-from typing import Optional, Union, Any
+from typing import Union, Any
 import logging
 from .utils import get_pid_list, get_sn
+from .const import RELAY_HOST, RELAY_PORT
 import threading
 
 CMD_INFO = 0
 CMD_QUERY = 2
 CMD_SET = 3
-CMD_LIST = [CMD_INFO, CMD_QUERY, CMD_SET]
 _LOGGER = logging.getLogger(__name__)
 
 
-class tcp_client(object):
-    """
-    Represents a device
-    send:{"cmd":0,"pv":0,"sn":"1636463553873","msg":{}}
-    receiver:{"cmd":0,"pv":0,"sn":"1636463553873","msg":{"did":"629168597cb94c4c1d8f","dtp":"02","pid":"e2s64v",
-    "mac":"7cb94c4c1d8f","ip":"192.168.123.57","rssi":-33,"sv":"1.0.0","hv":"0.0.1"},"res":0}
+def _parse_relay_line(line: str) -> dict:
+    """Parse a relay protocol line.
 
-    send:{"cmd":2,"pv":0,"sn":"1636463611798","msg":{"attr":[0]}}
-    receiver:{"cmd":2,"pv":0,"sn":"1636463611798","msg":{"attr":[1,2,3,4,5,6],"data":{"1":0,"2":0,"3":1000,"4":1000,
-    "5":65535,"6":65535}},"res":0}
-    
-    send:{"cmd":3,"pv":0,"sn":"1636463662455","msg":{"attr":[1],"data":{"1":0}}}
-    receiver:{"cmd":3,"pv":0,"sn":"1636463662455","msg":{"attr":[1],"data":{"1":0}},"res":0}
-    receiver:{"cmd":10,"pv":0,"sn":"1636463664000","res":0,"msg":{"attr":[1,2,3,4,5,6],"data":{"1":0,"2":0,"3":1000,
-    "4":1000,"5":65535,"6":65535}}}
+    Relay lines look like:
+      cmd=publish&device_id=xxx&topic=yyy&message={json with & and = inside}
+
+    The 'message' field is always last and may contain & and = inside the JSON,
+    so we split on '&message=' to isolate it before splitting the rest on '&'.
     """
-    _ip = str
-    _port = 5555
-    _connect = socket
-    
-    _device_id = None
-    # _device_key = str
-    _pid = None
-    _device_type_code = None
-    _icon = None
-    _device_model_name = None
-    # last sn
-    _sn = None
-    
-    def __init__(self, ip):
+    result = {}
+    msg_marker = '&message='
+    msg_idx = line.find(msg_marker)
+    if msg_idx != -1:
+        result['message'] = line[msg_idx + len(msg_marker):]
+        line = line[:msg_idx]
+    for part in line.split('&'):
+        if '=' in part:
+            k, _, v = part.partition('=')
+            result[k] = v
+    return result
+
+
+class tcp_client(object):
+    """Manages communication with a CozyLife device via the cloud relay server.
+
+    Device info (pid, model, dpid list, type code) is fetched via UDP port 6095
+    which responds freely.  Control and state query are done through the cloud
+    relay at RELAY_HOST:RELAY_PORT using a simple text pub/sub protocol.
+
+    Configuration requires:
+      - token: account auth token (cmd=auth)
+      - device_keys: dict of {device_id: device_key} (cmd=publish auth)
+
+    Protocol summary:
+      Send:  cmd=publish&device_id=DID&topic=control_DID&device_key=KEY&message={json}\r\n
+      Recv:  cmd=publish&device_id=DID&topic=device_DID&message={json}\r\n
+    """
+
+    def __init__(self, ip, token=None, device_keys=None):
         self._ip = ip
-        self._connect = None  # Initialize _connect as None
-        self._dpid = []  # Instance-level to avoid shared mutable class attribute
-        self._close_connection()
+        self._udp_port = 6095
+        self._token = token
+        self._device_keys = device_keys or {}
+
+        self._connect = None
+        self._device_key = None
+        self._device_id = None
+        self._pid = None
+        self._device_type_code = None
+        self._icon = None
+        self._device_model_name = None
+        self._dpid = []
+        self._recv_buf = b''
+        self._lock = threading.Lock()
+
+        # Get device info via UDP first (sets _device_id, _pid, etc.)
+        self._device_info()
+
+        # Resolve device_key now that _device_id is known
+        if self._device_id and self._device_id in self._device_keys:
+            self._device_key = self._device_keys[self._device_id]
+            _LOGGER.info('Device key resolved for %s', self._device_id)
+        else:
+            _LOGGER.warning(
+                'No device_key configured for device %s (ip=%s). '
+                'Add it under device_keys in configuration.yaml.',
+                self._device_id, self._ip,
+            )
+
+        # Connect to cloud relay
         self._reconnect()
-    
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
     def _close_connection(self):
         if self._connect:
             try:
                 self._connect.close()
             except Exception as e:
-                _LOGGER.error(f'Error while closing the connection: {e}')
+                _LOGGER.error('Error closing relay connection: %s', e)
             self._connect = None
-        
+
     def _reconnect(self):
-        def reconnect_thread():            
+        """Start a background thread that connects (and re-connects) to the relay."""
+        def reconnect_thread():
             while True:
                 try:
                     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    s.settimeout(3)
-                    s.connect((self._ip, self._port))
+                    s.settimeout(10)
+                    s.connect((RELAY_HOST, RELAY_PORT))
+
+                    if self._token:
+                        s.sendall(
+                            ('cmd=auth&token=' + self._token + '\r\n').encode()
+                        )
+                        time.sleep(0.3)
+
+                    if self._device_id and self._device_key:
+                        sub = (
+                            'cmd=subscribe'
+                            '&topic=device_' + self._device_id +
+                            '&from=control'
+                            '&device_id=' + self._device_id +
+                            '&device_key=' + self._device_key + '\r\n'
+                        )
+                        s.sendall(sub.encode())
+                        time.sleep(0.3)
+
                     self._connect = s
-                    self._device_info()
+                    self._recv_buf = b''
+                    _LOGGER.info('Relay connected for device %s', self._device_id)
                     return
+
                 except Exception as e:
-                    _LOGGER.info(f'Reconnection failed: {e}')
-                    time.sleep(60)  # Wait for 60 seconds before trying to reconnect
+                    _LOGGER.info('Relay reconnect failed: %s', e)
+                    time.sleep(60)
 
         thread = threading.Thread(target=reconnect_thread)
-        thread.daemon = True  # This makes the thread exit when the main program exits
+        thread.daemon = True
         thread.start()
 
+    def _device_info(self) -> None:
+        """Fetch device info via UDP CMD_INFO on port 6095.
+
+        This works cross-subnet because it is a direct UDP unicast to the
+        device IP, not a TCP connection.  The device responds with its did,
+        pid, mac, etc.
+        """
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(3)
+            sn = get_sn()
+            msg = json.dumps(
+                {'cmd': CMD_INFO, 'pv': 0, 'sn': sn, 'msg': {}},
+                separators=(',', ':'),
+            )
+            s.sendto(msg.encode(), (self._ip, self._udp_port))
+            data, _ = s.recvfrom(1024)
+            s.close()
+        except Exception as e:
+            _LOGGER.info('_device_info UDP failed for %s: %s', self._ip, e)
+            return
+
+        try:
+            resp = json.loads(data.strip())
+        except Exception:
+            return
+
+        msg_data = resp.get('msg')
+        if not isinstance(msg_data, dict):
+            return
+
+        self._device_id = msg_data.get('did')
+        self._pid = msg_data.get('pid')
+        if not self._device_id or not self._pid:
+            return
+
+        pid_list = get_pid_list()
+        for item in pid_list:
+            for item1 in item.get('m', []):
+                if item1.get('pid') == self._pid:
+                    self._icon = item1.get('i')
+                    self._device_model_name = item1.get('n')
+                    self._dpid = item1.get('dpid', [])
+                    self._device_type_code = item.get('c')
+                    break
+            if self._device_type_code:
+                break
+
+        _LOGGER.info(
+            'Device info: id=%s pid=%s type=%s model=%s',
+            self._device_id, self._pid,
+            self._device_type_code, self._device_model_name,
+        )
+
+    def _normalize_state(self, data: dict) -> dict:
+        """Normalise relay response data to plain integer values.
+
+        Some firmware versions return certain dpid values as hex-encoded
+        strings (e.g. color temp as "03e8") or out-of-range integers.
+        We convert hex strings to ints and drop values > 100 000 so that
+        the platform code can use plain arithmetic on all returned values.
+        """
+        MAX_VALID = 100_000
+        result = {}
+        for k, v in data.items():
+            if isinstance(v, int) and 0 <= v <= MAX_VALID:
+                result[k] = v
+            elif isinstance(v, str):
+                try:
+                    int_val = int(v, 16)
+                    if 0 <= int_val <= MAX_VALID:
+                        result[k] = int_val
+                except ValueError:
+                    pass
+        return result
+
+    def _send_relay(self, cmd_dict: dict) -> dict:
+        """Publish *cmd_dict* to the relay and return the device response data.
+
+        Blocks until the relay forwards the device's reply (matched by sn)
+        or a 5-second timeout expires.
+        """
+        with self._lock:
+            if self._connect is None:
+                _LOGGER.info('_send_relay: no relay connection')
+                return {}
+            if not self._device_id or not self._device_key:
+                _LOGGER.info('_send_relay: missing device_id or device_key')
+                return {}
+
+            sn = get_sn()
+            cmd_dict['sn'] = sn
+            message = json.dumps(cmd_dict, separators=(',', ':'))
+            line = (
+                'cmd=publish'
+                '&device_id=' + self._device_id +
+                '&topic=control_' + self._device_id +
+                '&device_key=' + self._device_key +
+                '&message=' + message + '\r\n'
+            )
+
+            try:
+                self._connect.sendall(line.encode())
+            except Exception as e:
+                _LOGGER.info('_send_relay send error: %s', e)
+                self._close_connection()
+                self._reconnect()
+                return {}
+
+            # Read response lines; skip relay acks and keepalives
+            deadline = time.time() + 5
+            buf = self._recv_buf
+            try:
+                while time.time() < deadline:
+                    remaining = deadline - time.time()
+                    self._connect.settimeout(max(0.1, remaining))
+                    try:
+                        chunk = self._connect.recv(4096)
+                        if not chunk:
+                            break
+                        buf += chunk
+                    except socket.timeout:
+                        continue
+
+                    # Process all complete lines in the buffer
+                    while b'\r\n' in buf:
+                        raw_line, buf = buf.split(b'\r\n', 1)
+                        if not raw_line:
+                            continue
+                        parts = _parse_relay_line(
+                            raw_line.decode('utf-8', errors='replace')
+                        )
+                        if (
+                            parts.get('cmd') == 'publish'
+                            and parts.get('device_id') == self._device_id
+                            and parts.get('topic') == 'device_' + self._device_id
+                            and 'message' in parts
+                        ):
+                            try:
+                                msg_obj = json.loads(parts['message'])
+                                if msg_obj.get('sn') == sn:
+                                    self._recv_buf = buf
+                                    data = msg_obj.get('msg', {}).get('data', {})
+                                    return self._normalize_state(data) if isinstance(data, dict) else {}
+                            except (json.JSONDecodeError, AttributeError):
+                                pass
+
+            except Exception as e:
+                _LOGGER.info('_send_relay recv error: %s', e)
+                self._close_connection()
+                self._reconnect()
+                return {}
+            finally:
+                try:
+                    self._connect.settimeout(None)
+                except Exception:
+                    pass
+
+            self._recv_buf = buf
+            return {}
+
+    # ------------------------------------------------------------------
+    # Public properties
+    # ------------------------------------------------------------------
 
     @property
     def check(self) -> bool:
-        """
-        Determine whether the device is filtered
-        :return:
-        """
         return True
-    
+
     @property
     def dpid(self):
         return self._dpid
-    
+
     @property
     def device_model_name(self):
         return self._device_model_name
-    
+
     @property
     def icon(self):
         return self._icon
-    
+
     @property
     def device_type_code(self) -> str:
         return self._device_type_code
-    
+
     @property
     def device_id(self):
         return self._device_id
-    
-    def _device_info(self) -> None:
-        """
-        get info for device model
-        :return:
-        """
-        self._only_send(CMD_INFO, {})
-        try:
-            resp = self._connect.recv(1024)
-            resp_json = json.loads(resp.strip())            
-        except:
-            _LOGGER.info('_device_info.recv.error')
-            return None
-        
-        if resp_json.get('msg') is None or type(resp_json['msg']) is not dict:
-            _LOGGER.info('_device_info.recv.error1')
-            
-            return None
-        
-        if resp_json['msg'].get('did') is None:
-            _LOGGER.info('_device_info.recv.error2')
-            
-            return None
 
-        self._device_id = resp_json['msg']['did']
-        
-        if resp_json['msg'].get('pid') is None:
-            _LOGGER.info('_device_info.recv.error3')
-            return None
-        
-        self._pid = resp_json['msg']['pid']        
-        pid_list = get_pid_list()
+    # ------------------------------------------------------------------
+    # Public API used by platforms
+    # ------------------------------------------------------------------
 
-        for item in pid_list:
-            match = False
-            for item1 in item['m']:
-                if item1['pid'] == self._pid:
-                    match = True
-                    self._icon = item1['i']
-                    self._device_model_name = item1['n']
-                    self._dpid = item1['dpid']
-                    break
-            
-            if match:
-                self._device_type_code = item['c']                
-                break
-        
-        # _LOGGER.info(pid_list)
-        _LOGGER.info(self._device_id)
-        _LOGGER.info(self._device_type_code)
-        _LOGGER.info(self._pid)
-        _LOGGER.info(self._device_model_name)
-        _LOGGER.info(self._icon)
-    
-    def _get_package(self, cmd: int, payload: dict) -> bytes:
-        """
-        package message
-        :param cmd:int:
-        :param payload:
-        :return:
-        """
-        self._sn = get_sn()
-        if CMD_SET == cmd:
-            message = {
-                'pv': 0,
-                'cmd': cmd,
-                'sn': self._sn,
-                'msg': {
-                    'attr': [int(item) for item in payload.keys()],
-                    'data': payload,
-                }
-            }
-        elif CMD_QUERY == cmd:
-            message = {
-                'pv': 0,
-                'cmd': cmd,
-                'sn': self._sn,
-                'msg': {
-                    'attr': [0],
-                }
-            }
-        elif CMD_INFO == cmd:
-            message = {
-                'pv': 0,
-                'cmd': cmd,
-                'sn': self._sn,
-                'msg': {}
-            }
-        else:
-            raise Exception('CMD is not valid')
-        
-        payload_str = json.dumps(message, separators=(',', ':',))
-        _LOGGER.info(f'_package={payload_str}')
-        return bytes(payload_str + "\r\n", encoding='utf8')
-    
-    def _send_receiver(self, cmd: int, payload: dict) -> Union[dict, Any]:
-        """
-        send & receiver
-        :param cmd:
-        :param payload:
-        :return:
-        """
-        if self._connect is None:
-            _LOGGER.info('_send_receiver: no connection, skipping')
-            return {}
-        self._connect.send(self._get_package(cmd, payload))
-        try:
-            i = 10
-            while i > 0:
-                res = self._connect.recv(1024)
-                # print(f'res={res},sn={self._sn},{self._sn in str(res)}')
-                i -= 1
-                #only allow same sn
-                if self._sn in str(res):
-                    payload = json.loads(res.strip())
-                    if payload is None or len(payload) == 0:
-                        return {}
-
-                    if payload.get('msg') is None or type(payload['msg']) is not dict:
-                        return {}
-
-                    if payload['msg'].get('data') is None or type(payload['msg']['data']) is not dict:
-                        return {}
-
-                    return payload['msg']['data']
-
-            return {}
-
-        except Exception as e:
-            _LOGGER.info(f'_only_send.recv.error: {e}')
-            self._reconnect()  # Reconnect on exception
-            return {}
-    
-    def _only_send(self, cmd: int, payload: dict) -> None:
-        """
-        send but not receiver
-        :param cmd:
-        :param payload:
-        :return:
-        """
-        if self._connect is None:
-            _LOGGER.info('_only_send: no connection, skipping')
-            return
-        self._connect.send(self._get_package(cmd, payload))
-    
-    def control(self, payload: dict) -> bool:
-        """
-        control use dpid
-        :param payload:
-        :return:
-        """
-        self._only_send(CMD_SET, payload)
-        return True
-    
     def query(self) -> dict:
+        """Query the full device state via cloud relay.
+
+        Returns a dict of {dpid: int_value} normalised to plain integers.
         """
-        query device state
-        :return:
+        return self._send_relay({'cmd': CMD_QUERY, 'pv': 0, 'msg': {'attr': [0]}})
+
+    def control(self, payload: dict) -> bool:
+        """Send a CMD_SET to the device via cloud relay.
+
+        *payload* is a dict of {dpid_str: int_value}, e.g. {'1': 1, '4': 500}.
+        Returns True if the send succeeded (does not wait for device ack).
         """
-        return self._send_receiver(CMD_QUERY, {})
+        if self._connect is None:
+            _LOGGER.info('control: no relay connection')
+            return False
+        if not self._device_id or not self._device_key:
+            return False
+        try:
+            sn = get_sn()
+            message = json.dumps(
+                {
+                    'cmd': CMD_SET,
+                    'pv': 0,
+                    'sn': sn,
+                    'msg': {
+                        'attr': [int(k) for k in payload.keys()],
+                        'data': payload,
+                    },
+                },
+                separators=(',', ':'),
+            )
+            line = (
+                'cmd=publish'
+                '&device_id=' + self._device_id +
+                '&topic=control_' + self._device_id +
+                '&device_key=' + self._device_key +
+                '&message=' + message + '\r\n'
+            )
+            self._connect.sendall(line.encode())
+            return True
+        except Exception as e:
+            _LOGGER.info('control error: %s', e)
+            self._close_connection()
+            self._reconnect()
+            return False

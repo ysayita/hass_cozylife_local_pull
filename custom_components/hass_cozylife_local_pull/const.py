@@ -17,3 +17,11 @@ LIGHT_DPID = [SWITCH, WORK_MODE, TEMP, BRIGHT, HUE, SAT]
 SWITCH_DPID = [SWITCH, ]
 LANG = 'en'
 API_DOMAIN = 'api-us.doiting.com'
+
+# Cloud relay server (used instead of local TCP port 5555)
+RELAY_HOST = '139.162.135.94'
+RELAY_PORT = 8899
+
+# Configuration keys
+TOKEN_CONF = 'token'
+DEVICE_KEYS_CONF = 'device_keys'

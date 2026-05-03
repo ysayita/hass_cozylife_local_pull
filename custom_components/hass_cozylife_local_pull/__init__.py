@@ -8,7 +8,9 @@ from homeassistant.helpers.typing import ConfigType
 import logging
 from .const import (
     DOMAIN,
-    LANG
+    LANG,
+    TOKEN_CONF,
+    DEVICE_KEYS_CONF,
 )
 from .utils import get_pid_list
 from .udp_discover import get_ip
@@ -36,10 +38,16 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     lang_from_config = (config[DOMAIN].get('lang') if config[DOMAIN].get('lang') is not None else LANG)
     await hass.async_add_executor_job(get_pid_list, lang_from_config)
 
+    token = config[DOMAIN].get(TOKEN_CONF)
+    device_keys = config[DOMAIN].get(DEVICE_KEYS_CONF) or {}
+
     hass.data[DOMAIN] = {
         'temperature': 24,
         'ip': ip_list,
-        'tcp_client': [tcp_client(item) for item in ip_list],
+        'tcp_client': [
+            tcp_client(item, token=token, device_keys=device_keys)
+            for item in ip_list
+        ],
     }
 
     # Wait for TCP connections and device info to be retrieved
